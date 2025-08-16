@@ -1,0 +1,144 @@
+# Docker Compose for Document Analytics Infrastructure
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: document-analytics-db
+    environment:
+      POSTGRES_DB: document_analytics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - document-analytics-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d document_analytics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for Caching and Job Queue
+  redis:
+    image: redis:7-alpine
+    container_name: document-analytics-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - document-analytics-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Document Processing Service
+  document-processor:
+    build:
+      context: ./services/document-processor
+      dockerfile: Dockerfile
+    container_name: document-processor
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:postgres_password@postgres:5432/document_analytics
+      - REDIS_URL=redis://redis:6379
+      - OPENTEXT_BASE_URL=http://opentext-dms:8080
+      - OPENTEXT_USERNAME=${OPENTEXT_USERNAME}
+      - OPENTEXT_PASSWORD=${OPENTEXT_PASSWORD}
+      - OPENTEXT_API_KEY=${OPENTEXT_API_KEY}
+      - OCR_API_KEY=${OCR_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SCHEDULE_ENABLED=true
+      - SCHEDULE_INTERVAL=14400000
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - document-analytics-network
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - ./temp:/app/temp
+
+  # OpenText DMS (Mock for demo)
+  opentext-dms:
+    image: nginx:alpine
+    container_name: opentext-dms-mock
+    ports:
+      - "8080:80"
+    volumes:
+      - ./mock-services/opentext:/usr/share/nginx/html
+    networks:
+      - document-analytics-network
+    restart: unless-stopped
+
+  # Dashboard Frontend
+  dashboard:
+    build:
+      context: ../
+      dockerfile: infrastructure/Dockerfile.dashboard
+    container_name: document-dashboard
+    environment:
+      - NODE_ENV=production
+      - VITE_API_BASE_URL=http://document-processor:3001
+      - VITE_OPENAI_API_KEY=${OPENAI_API_KEY}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - document-processor
+    networks:
+      - document-analytics-network
+    restart: unless-stopped
+
+  # Monitoring - Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: document-analytics-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - document-analytics-network
+    restart: unless-stopped
+
+  # Monitoring - Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: document-analytics-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - document-analytics-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  document-analytics-network:
+    driver: bridge
